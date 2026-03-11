@@ -1,0 +1,22 @@
+import { Schema, model, InferSchemaType, Types } from "mongoose";
+
+const downloadSchema = new Schema(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    targetUsername: { type: String, required: true },
+    type: { type: String, required: true, enum: ["current", "last", "all"] },
+    sessionPhone: { type: String, required: true },
+    mediaCount: { type: Number, required: true },
+    downloadedAt: { type: Date, required: true, default: Date.now },
+  },
+  {
+    versionKey: false,
+    collection: "downloads",
+  }
+);
+
+export type DownloadDocument = Omit<InferSchemaType<typeof downloadSchema>, "userId"> & {
+  userId: Types.ObjectId;
+};
+
+export const DownloadModel = model<DownloadDocument>("Download", downloadSchema);
