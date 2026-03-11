@@ -7,11 +7,6 @@ import { TELEGRAM_API_HASH, TELEGRAM_API_ID } from "../config";
 export async function createAuthClient(): Promise<TelegramClient> {
   const client = new TelegramClient(new StringSession(""), TELEGRAM_API_ID, TELEGRAM_API_HASH, {
     connectionRetries: 5,
-    deviceModel: "iPhone 14 Pro",
-    systemVersion: "iOS 16.6",
-    appVersion: "9.6.3",
-    langCode: "en",
-    systemLangCode: "en",
   });
   await client.connect();
   return client;
