@@ -1,25 +1,24 @@
 import mongoose from "mongoose";
-import { createBot } from "./bot";
-import { MONGO_URI, SUPER_ADMIN_ID } from "./config";
+import { MONGO_URI } from "./config";
 import { gramJsPool } from "./gramjs/client";
+import { startWorker, stopWorker } from "./queue/worker";
 import { logger } from "./logger";
 
 async function bootstrap(): Promise<void> {
   await mongoose.connect(MONGO_URI);
   logger.info("MongoDB connected");
-  logger.info({ superAdminId: SUPER_ADMIN_ID }, "SUPER_ADMIN_ID loaded");
 
-  // Bot process needs the pool loaded so session management commands
-  // (/addsession, /removesession, /sessions) work correctly.
+  // Worker process needs the pool loaded so it can pick a client for each job.
   await gramJsPool.loadActiveSessions();
   logger.info({ count: gramJsPool.getActiveCount() }, "loaded active GramJS sessions");
 
-  const bot = createBot();
+  startWorker();
+  logger.info("BullMQ worker started");
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, "received signal, shutting down");
     try {
-      bot.stop();
+      await stopWorker();
       await gramJsPool.shutdown();
       await mongoose.disconnect();
       logger.info("shutdown complete");
@@ -32,9 +31,6 @@ async function bootstrap(): Promise<void> {
 
   process.on("SIGINT", () => { void shutdown("SIGINT"); });
   process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
-
-  logger.info("bot started");
-  await bot.start();
 }
 
 bootstrap().catch((error) => {

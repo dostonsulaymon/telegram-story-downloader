@@ -1,6 +1,7 @@
 import { Composer } from "grammy";
 import { BotContext } from "../index";
 import { SessionModel } from "../../models/session.model";
+import { logger } from "../../logger";
 
 export function registerSessionsCommand(composer: Composer<BotContext>): void {
   composer.command("sessions", async (ctx) => {
@@ -18,7 +19,7 @@ export function registerSessionsCommand(composer: Composer<BotContext>): void {
 
       await ctx.reply(lines.join("\n"));
     } catch (error) {
-      console.error("Failed to list sessions", error);
+      logger.error({ err: error }, "failed to list sessions");
       await ctx.reply("Failed to list sessions.");
     }
   });

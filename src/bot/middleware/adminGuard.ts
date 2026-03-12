@@ -2,6 +2,7 @@ import { MiddlewareFn } from "grammy";
 import { SUPER_ADMIN_ID } from "../../config";
 import { AdminModel } from "../../models/admin.model";
 import { BotContext } from "../index";
+import { logger } from "../../logger";
 
 export const adminGuard: MiddlewareFn<BotContext> = async (ctx, next) => {
   const telegramId = ctx.from?.id;
@@ -24,7 +25,7 @@ export const adminGuard: MiddlewareFn<BotContext> = async (ctx, next) => {
 
     await next();
   } catch (error) {
-    console.error("Admin guard failure", error);
+    logger.error({ err: error }, "admin guard failure");
     await ctx.reply("Authorization check failed.");
   }
 };

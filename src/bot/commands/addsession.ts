@@ -1,6 +1,5 @@
 import { Composer } from "grammy";
 import { Conversation } from "@grammyjs/conversations";
-import { TelegramClient } from "telegram";
 import { RPCError } from "telegram/errors";
 import { BotContext, InternalContext } from "../index";
 import { SessionModel } from "../../models/session.model";
@@ -11,11 +10,16 @@ import {
   signInWithCode,
   signInWith2FA,
   extractSessionString,
+  registerClient,
+  getRegisteredClient,
+  unregisterClient,
 } from "../../gramjs/auth";
-
-// Holds the single GramJS client for each admin mid-auth.
-// Keyed by Telegram user ID. Deleted on success or failure.
-const pendingClients = new Map<string, TelegramClient>();
+import {
+  setPendingClient,
+  getPendingClient,
+  deletePendingClient,
+} from "../../redis";
+import { logger } from "../../logger";
 
 async function askText(
   conversation: Conversation<BotContext, InternalContext>,
@@ -29,11 +33,15 @@ async function askText(
   return text.trim();
 }
 
+// Removes the pending auth entry from Redis and disconnects the client from the
+// in-process registry. Safe to call even if the entry is already gone.
 async function cleanupPending(userId: string): Promise<void> {
-  const client = pendingClients.get(userId);
-  pendingClients.delete(userId);
-  if (client) {
-    await client.disconnect().catch(() => {});
+  const clientKey = await getPendingClient(userId);
+  await deletePendingClient(userId);
+  if (clientKey) {
+    const client = getRegisteredClient(clientKey);
+    unregisterClient(clientKey);
+    if (client) await client.disconnect().catch(() => {});
   }
 }
 
@@ -44,15 +52,16 @@ export async function addSessionConversation(
   const userId = String(ctx.from!.id);
   const phone = await askText(conversation, ctx, "Send phone in international format (e.g. +15551234567):");
 
-  // conversation.external() runs this block exactly once regardless of replays.
-  // The client is stored in pendingClients so subsequent steps reuse the same
-  // MTProto connection — the phoneCodeHash is bound to that connection.
+  // Runs once; client is registered in clientRegistry so every subsequent step
+  // reuses the same MTProto connection and phoneCodeHash binding.
+  // Redis stores userId → clientKey so other bot instances see who owns this auth.
   let phoneCodeHash: string;
   try {
     phoneCodeHash = await conversation.external(async () => {
-      await cleanupPending(userId); // clear any stale client from a previous attempt
+      await cleanupPending(userId);
       const client = await createAuthClient();
-      pendingClients.set(userId, client);
+      const clientKey = registerClient(client);
+      await setPendingClient(userId, clientKey);
       return sendAuthCode(client, phone);
     });
   } catch (error) {
@@ -63,35 +72,61 @@ export async function addSessionConversation(
   }
 
   const code = await askText(conversation, ctx, "Enter the login code from Telegram:");
-  console.log(`[addsession] raw code from user: ${JSON.stringify(code)}`);
+  logger.info({ userId }, "received login code from user");
 
-  // conversation.external() caches the result (or thrown error) on first run and
-  // replays the cached value on subsequent replays — so signIn is never called twice.
-  let needs2FA = false;
+  // SESSION_PASSWORD_NEEDED is caught inside external() and returned as a plain
+  // serialisable object. Catching a thrown RPCError after external() is unreliable
+  // because the session store serialises errors as plain objects, breaking instanceof.
+  type SignInResult = { ok: true } | { ok: false; needs2FA: true } | { ok: false; needs2FA: false; error: string };
+
+  let signInResult: SignInResult;
   try {
-    await conversation.external(async () => {
-      const client = pendingClients.get(userId);
+    signInResult = await conversation.external(async (): Promise<SignInResult> => {
+      const clientKey = await getPendingClient(userId);
+      const client = clientKey ? getRegisteredClient(clientKey) : undefined;
       if (!client) throw new Error("Auth client not found — restart /addsession");
-      await signInWithCode(client, phone, phoneCodeHash, code);
+      try {
+        await signInWithCode(client, phone, phoneCodeHash, code);
+        return { ok: true };
+      } catch (error) {
+        if (error instanceof RPCError && error.errorMessage === "SESSION_PASSWORD_NEEDED") {
+          return { ok: false, needs2FA: true };
+        }
+        const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
+        return { ok: false, needs2FA: false, error: message };
+      }
     });
   } catch (error) {
-    if (error instanceof RPCError && error.errorMessage === "SESSION_PASSWORD_NEEDED") {
-      needs2FA = true;
-    } else {
-      await cleanupPending(userId);
-      const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
-      await ctx.reply(`Auth failed: ${message}`);
-      return;
-    }
+    await cleanupPending(userId);
+    const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
+    await ctx.reply(`Auth failed: ${message}`);
+    return;
   }
 
-  if (needs2FA) {
+  if (!signInResult.ok && !signInResult.needs2FA) {
+    await cleanupPending(userId);
+    await ctx.reply(`Auth failed: ${signInResult.error}`);
+    return;
+  }
+
+  if (!signInResult.ok && signInResult.needs2FA) {
     const password = await askText(conversation, ctx, "2FA is enabled. Send your password:");
+
+    type TwoFAResult = { ok: true } | { ok: false; error: string };
+
+    let twoFAResult: TwoFAResult;
     try {
-      await conversation.external(async () => {
-        const client = pendingClients.get(userId);
+      twoFAResult = await conversation.external(async (): Promise<TwoFAResult> => {
+        const clientKey = await getPendingClient(userId);
+        const client = clientKey ? getRegisteredClient(clientKey) : undefined;
         if (!client) throw new Error("Auth client not found — restart /addsession");
-        await signInWith2FA(client, password);
+        try {
+          await signInWith2FA(client, password);
+          return { ok: true };
+        } catch (error) {
+          const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
+          return { ok: false, error: message };
+        }
       });
     } catch (error) {
       await cleanupPending(userId);
@@ -99,11 +134,18 @@ export async function addSessionConversation(
       await ctx.reply(`2FA failed: ${message}`);
       return;
     }
+
+    if (!twoFAResult.ok) {
+      await cleanupPending(userId);
+      await ctx.reply(`2FA failed: ${twoFAResult.error}`);
+      return;
+    }
   }
 
   // No more waitFor calls after this point — runs once, no further replay.
   try {
-    const client = pendingClients.get(userId);
+    const clientKey = await getPendingClient(userId);
+    const client = clientKey ? getRegisteredClient(clientKey) : undefined;
     if (!client) throw new Error("Auth client not found — restart /addsession");
 
     const sessionString = extractSessionString(client);
@@ -118,8 +160,10 @@ export async function addSessionConversation(
       { upsert: true }
     );
 
+    // Ownership transferred to pool — remove from registry and Redis but do not disconnect.
     await gramJsPool.addReadyClient(phone, client);
-    pendingClients.delete(userId); // ownership transferred to pool — do not disconnect
+    await deletePendingClient(userId);
+    if (clientKey) unregisterClient(clientKey);
     await ctx.reply("Session added and activated.");
   } catch (error) {
     await cleanupPending(userId);

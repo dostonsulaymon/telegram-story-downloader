@@ -2,11 +2,17 @@ import { StringSession } from "telegram/sessions";
 import { TelegramClient } from "telegram";
 import { Api } from "telegram";
 import { computeCheck } from "telegram/Password";
+import { randomUUID } from "node:crypto";
 import { TELEGRAM_API_HASH, TELEGRAM_API_ID } from "../config";
 
 export async function createAuthClient(): Promise<TelegramClient> {
   const client = new TelegramClient(new StringSession(""), TELEGRAM_API_ID, TELEGRAM_API_HASH, {
-    connectionRetries: 5,
+    autoReconnect: true,
+    connectionRetries: 10,
+    retryDelay: 1000,
+    timeout: 30,
+    useWSS: false,
+    downloadRetries: 5,
   });
   await client.connect();
   return client;
@@ -43,4 +49,23 @@ export async function signInWith2FA(client: TelegramClient, password: string): P
 
 export function extractSessionString(client: TelegramClient): string {
   return (client.session as StringSession).save();
+}
+
+// In-process registry mapping a random UUID key → TelegramClient.
+// Redis stores userId → clientKey so multiple bot instances can agree on
+// who owns an in-progress auth session. The client itself must stay in memory.
+export const clientRegistry = new Map<string, TelegramClient>();
+
+export function registerClient(client: TelegramClient): string {
+  const key = randomUUID();
+  clientRegistry.set(key, client);
+  return key;
+}
+
+export function getRegisteredClient(key: string): TelegramClient | undefined {
+  return clientRegistry.get(key);
+}
+
+export function unregisterClient(key: string): void {
+  clientRegistry.delete(key);
 }

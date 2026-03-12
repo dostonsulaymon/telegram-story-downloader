@@ -7,6 +7,7 @@ const downloadSchema = new Schema(
     type: { type: String, required: true, enum: ["current", "last", "all"] },
     sessionPhone: { type: String, required: true },
     mediaCount: { type: Number, required: true },
+    status: { type: String, required: true, enum: ["success", "failed"], default: "success" },
     downloadedAt: { type: Date, required: true, default: Date.now },
   },
   {

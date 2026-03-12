@@ -2,6 +2,7 @@ import { Composer } from "grammy";
 import { BotContext } from "../index";
 import { SUPER_ADMIN_ID } from "../../config";
 import { AdminModel } from "../../models/admin.model";
+import { logger } from "../../logger";
 
 export function registerRemoveAdminCommand(composer: Composer<BotContext>): void {
   composer.command("removeadmin", async (ctx) => {
@@ -27,7 +28,7 @@ export function registerRemoveAdminCommand(composer: Composer<BotContext>): void
 
       await ctx.reply(`Admin removed: ${telegramId}`);
     } catch (error) {
-      console.error("Failed to remove admin", error);
+      logger.error({ err: error }, "failed to remove admin");
       await ctx.reply("Failed to remove admin.");
     }
   });

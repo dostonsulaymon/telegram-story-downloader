@@ -2,6 +2,7 @@ import { Composer } from "grammy";
 import { BotContext } from "../index";
 import { SUPER_ADMIN_ID } from "../../config";
 import { AdminModel } from "../../models/admin.model";
+import { logger } from "../../logger";
 
 export function registerAdminsCommand(composer: Composer<BotContext>): void {
   composer.command("admins", async (ctx) => {
@@ -15,7 +16,7 @@ export function registerAdminsCommand(composer: Composer<BotContext>): void {
 
       await ctx.reply(lines.join("\n"));
     } catch (error) {
-      console.error("Failed to list admins", error);
+      logger.error({ err: error }, "failed to list admins");
       await ctx.reply("Failed to list admins.");
     }
   });

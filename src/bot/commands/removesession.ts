@@ -1,6 +1,7 @@
 import { Composer } from "grammy";
 import { BotContext } from "../index";
 import { gramJsPool } from "../../gramjs/client";
+import { logger } from "../../logger";
 
 export function registerRemoveSessionCommand(composer: Composer<BotContext>): void {
   composer.command("removesession", async (ctx) => {
@@ -19,7 +20,7 @@ export function registerRemoveSessionCommand(composer: Composer<BotContext>): vo
 
       await ctx.reply(`Session removed: ${phone}`);
     } catch (error) {
-      console.error("Failed to remove session", error);
+      logger.error({ phone, err: error }, "failed to remove session");
       await ctx.reply("Failed to remove session.");
     }
   });

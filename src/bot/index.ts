@@ -2,7 +2,6 @@ import {
   Bot,
   Context,
   InlineKeyboard,
-  InputFile,
   session,
   SessionFlavor,
 } from "grammy";
@@ -20,16 +19,11 @@ import { registerAddAdminCommand } from "./commands/addadmin";
 import { registerRemoveAdminCommand } from "./commands/removeadmin";
 import { registerAdminsCommand } from "./commands/admins";
 import { registerStatsCommand } from "./commands/stats";
-import { gramJsPool } from "../gramjs/client";
-import {
-  DownloadType,
-  fetchAllStories,
-  fetchCurrentStory,
-  fetchLastStory,
-  StoryMedia,
-} from "../gramjs/stories";
+import { DownloadType } from "../gramjs/stories";
+import { addDownloadJob } from "../queue/producer";
 import { UserModel } from "../models/user.model";
-import { DownloadModel } from "../models/download.model";
+import { checkRateLimit } from "../middleware/rateLimiter";
+import { logger } from "../logger";
 
 export type InternalContext = Context & SessionFlavor<Record<string, unknown>>;
 export type BotContext = ConversationFlavor<InternalContext>;
@@ -50,18 +44,6 @@ function keyboardFor(username: string): InlineKeyboard {
     .text("Current", `story:current:${username}`)
     .text("Last", `story:last:${username}`)
     .text("All", `story:all:${username}`);
-}
-
-async function sendStoryMedia(ctx: BotContext, media: StoryMedia): Promise<void> {
-  const filename = media.filename ?? `story_${Date.now()}`;
-  const input = new InputFile(media.buffer, filename);
-
-  if (media.kind === "video") {
-    await ctx.replyWithVideo(input);
-    return;
-  }
-
-  await ctx.replyWithPhoto(input);
 }
 
 export function createBot(): Bot<BotContext> {
@@ -93,7 +75,7 @@ export function createBot(): Bot<BotContext> {
           { upsert: true }
         );
       } catch (error) {
-        console.error("Failed to upsert user", error);
+        logger.error({ err: error }, "failed to upsert user");
       }
     }
 
@@ -148,56 +130,84 @@ export function createBot(): Bot<BotContext> {
   });
 
   bot.callbackQuery(/^story:(current|last|all):([A-Za-z0-9_]{5,32})$/, async (ctx) => {
+    logger.info({ data: ctx.callbackQuery.data, from: ctx.from.id }, "story callback received");
     await ctx.answerCallbackQuery();
 
-    const match = ctx.match;
-    const type = match[1] as DownloadType;
-    const username = match[2];
+    const type = ctx.match[1] as DownloadType;
+    const username = ctx.match[2];
+    const userId = String(ctx.from.id);
+
+    const rateCheck = await checkRateLimit(userId);
+    if (!rateCheck.allowed) {
+      await ctx.reply(`⚠️ Too many requests, try again in ${rateCheck.retryAfter} seconds.`);
+      return;
+    }
+
+    // Edit the original keyboard message in-place: remove buttons, update text.
+    // The worker will continue editing this same message for status updates.
+    await ctx.editMessageText(
+      `⏳ Queued: fetching ${type} stories for @${username}...`,
+      { reply_markup: new InlineKeyboard() }
+    );
+
+    const queuedMessageId = ctx.callbackQuery.message!.message_id;
 
     try {
-      const { phone, client } = await gramJsPool.pickClient();
+      await addDownloadJob({
+        userId,
+        chatId: ctx.chat!.id,
+        targetUsername: username,
+        type,
+        queuedMessageId,
+        offset: 0,
+      });
+    } catch {
+      await ctx.editMessageText("⚠️ Service is overloaded, try again later.");
+    }
+  });
 
-      let mediaItems: StoryMedia[] = [];
-      if (type === "current") {
-        const item = await fetchCurrentStory(client, username);
-        if (item) mediaItems = [item];
-      } else if (type === "last") {
-        const item = await fetchLastStory(client, username);
-        if (item) mediaItems = [item];
-      } else {
-        mediaItems = await fetchAllStories(client, username);
-      }
+  // Handles "Load more" buttons sent by the worker for paginated "all" downloads.
+  // Callback data format: more:{userId}:{offset}:{username}
+  bot.callbackQuery(/^more:(\d+):(\d+):([A-Za-z0-9_]{5,32})$/, async (ctx) => {
+    const embeddedUserId = ctx.match[1];
+    const offset = Number(ctx.match[2]);
+    const username = ctx.match[3];
+    const userId = String(ctx.from.id);
 
-      if (mediaItems.length === 0) {
-        await ctx.reply("No stories found for this user.");
-        return;
-      }
+    if (userId !== embeddedUserId) {
+      await ctx.answerCallbackQuery({ text: "⚠️ This button is not for you." });
+      return;
+    }
 
-      for (const media of mediaItems) {
-        await sendStoryMedia(ctx, media);
-      }
+    await ctx.answerCallbackQuery();
 
-      if (ctx.from) {
-        const user = await UserModel.findOne({ telegramId: ctx.from.id }).select("_id");
-        if (user) {
-          await DownloadModel.create({
-            userId: user._id,
-            targetUsername: username,
-            type,
-            sessionPhone: phone,
-            mediaCount: mediaItems.length,
-            downloadedAt: new Date(),
-          });
-        }
-      }
-    } catch (error) {
-      console.error("Story download failed", error);
-      await ctx.reply("Failed to download stories. Please try again later.");
+    const rateCheck = await checkRateLimit(userId);
+    if (!rateCheck.allowed) {
+      await ctx.reply(`⚠️ Too many requests, try again in ${rateCheck.retryAfter} seconds.`);
+      return;
+    }
+
+    // Replace the "Load more" button with a status message the worker will update.
+    await ctx.editMessageText("⏳ Loading more stories...", { reply_markup: new InlineKeyboard() });
+
+    const queuedMessageId = ctx.callbackQuery.message!.message_id;
+
+    try {
+      await addDownloadJob({
+        userId,
+        chatId: ctx.chat!.id,
+        targetUsername: username,
+        type: "all",
+        queuedMessageId,
+        offset,
+      });
+    } catch {
+      await ctx.editMessageText("⚠️ Service is overloaded, try again later.");
     }
   });
 
   bot.catch((error) => {
-    console.error("Bot error", error.error);
+    logger.error({ err: error.error }, "bot error");
   });
 
   return bot;

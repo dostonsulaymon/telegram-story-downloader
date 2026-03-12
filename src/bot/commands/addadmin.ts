@@ -1,6 +1,7 @@
 import { Composer } from "grammy";
 import { BotContext } from "../index";
 import { AdminModel } from "../../models/admin.model";
+import { logger } from "../../logger";
 
 export function registerAddAdminCommand(composer: Composer<BotContext>): void {
   composer.command("addadmin", async (ctx) => {
@@ -27,7 +28,7 @@ export function registerAddAdminCommand(composer: Composer<BotContext>): void {
 
       await ctx.reply(`Admin added: ${telegramId}`);
     } catch (error) {
-      console.error("Failed to add admin", error);
+      logger.error({ err: error }, "failed to add admin");
       await ctx.reply("Failed to add admin.");
     }
   });
