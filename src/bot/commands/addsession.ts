@@ -19,6 +19,7 @@ import {
   getPendingClient,
   deletePendingClient,
 } from "../../redis";
+import { toUserMessage } from "../../utils/userErrors";
 import { logger } from "../../logger";
 
 async function askText(
@@ -59,15 +60,15 @@ export async function addSessionConversation(
   try {
     phoneCodeHash = await conversation.external(async () => {
       await cleanupPending(userId);
-      const client = await createAuthClient();
+      const client = await createAuthClient(phone);
       const clientKey = registerClient(client);
       await setPendingClient(userId, clientKey);
       return sendAuthCode(client, phone);
     });
   } catch (error) {
     await cleanupPending(userId);
-    const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
-    await ctx.reply(`Failed to send code: ${message}`);
+    logger.error({ userId, err: error }, "addsession: failed to send code");
+    await ctx.reply(toUserMessage(error));
     return;
   }
 
@@ -98,14 +99,15 @@ export async function addSessionConversation(
     });
   } catch (error) {
     await cleanupPending(userId);
-    const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
-    await ctx.reply(`Auth failed: ${message}`);
+    logger.error({ userId, err: error }, "addsession: sign-in failed");
+    await ctx.reply(toUserMessage(error));
     return;
   }
 
   if (!signInResult.ok && !signInResult.needs2FA) {
     await cleanupPending(userId);
-    await ctx.reply(`Auth failed: ${signInResult.error}`);
+    logger.error({ userId, error: signInResult.error }, "addsession: sign-in rejected");
+    await ctx.reply(toUserMessage(signInResult.error));
     return;
   }
 
@@ -130,14 +132,15 @@ export async function addSessionConversation(
       });
     } catch (error) {
       await cleanupPending(userId);
-      const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
-      await ctx.reply(`2FA failed: ${message}`);
+      logger.error({ userId, err: error }, "addsession: 2FA failed");
+      await ctx.reply(toUserMessage(error));
       return;
     }
 
     if (!twoFAResult.ok) {
       await cleanupPending(userId);
-      await ctx.reply(`2FA failed: ${twoFAResult.error}`);
+      logger.error({ userId, error: twoFAResult.error }, "addsession: 2FA rejected");
+      await ctx.reply(toUserMessage(twoFAResult.error));
       return;
     }
   }
@@ -167,8 +170,8 @@ export async function addSessionConversation(
     await ctx.reply("Session added and activated.");
   } catch (error) {
     await cleanupPending(userId);
-    const message = error instanceof RPCError ? error.errorMessage : (error as Error).message;
-    await ctx.reply(`Failed to save session: ${message}`);
+    logger.error({ userId, err: error }, "addsession: failed to save session");
+    await ctx.reply(toUserMessage(error));
   }
 }
 

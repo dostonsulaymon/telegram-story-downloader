@@ -1,10 +1,11 @@
 import { Worker, Job } from "bullmq";
 import { Api, InputFile, InlineKeyboard } from "grammy";
 import pino from "pino";
-import { BOT_TOKEN, WORKER_CONCURRENCY, SUPER_ADMIN_ID } from "../config";
+import { BOT_TOKEN, WORKER_CONCURRENCY, SUPER_ADMIN_ID, REQUEST_JITTER_MS_MIN, REQUEST_JITTER_MS_MAX } from "../config";
+import { toUserMessage } from "../utils/userErrors";
 import { redis } from "../redis";
 import { gramJsPool } from "../gramjs/client";
-import { fetchRawItems, downloadRawItem, RawStoryItem, StoryMedia } from "../gramjs/stories";
+import { fetchRawItems, fetchSingleStory, downloadRawItem, RawStoryItem, StoryMedia } from "../gramjs/stories";
 import {
   getCachedStory,
   setCachedStory,
@@ -42,8 +43,56 @@ function formatStoryDate(unixSeconds: number): string {
 }
 
 function buildCaption(index: number, total: number, date: number, originalCaption?: string): string {
-  const header = `${index + 1}/${total} · ${formatStoryDate(date)}`;
+  const header = `${index}/${total} · ${formatStoryDate(date)}`;
   return originalCaption ? `${header}\n${originalCaption}` : header;
+}
+
+function buildSingleCaption(date: number, originalCaption?: string): string {
+  const dateStr = formatStoryDate(date);
+  return originalCaption ? `${dateStr}\n${originalCaption}` : dateStr;
+}
+
+// Sends already-resolved StoryMedia to chatId with the given caption.
+// Handles both the cached file_id path and the log channel upload path.
+async function sendMedia(
+  media: StoryMedia,
+  item: RawStoryItem,
+  caption: string,
+  chatId: number,
+  jobLog: pino.Logger<never>
+): Promise<void> {
+  if (media.fileId) {
+    jobLog.info({ storyId: item.id, kind: media.kind }, "sending via cached file_id");
+    if (media.kind === "video") {
+      await api.sendVideo(chatId, media.fileId, { caption, parse_mode: "HTML" });
+    } else {
+      await api.sendPhoto(chatId, media.fileId, { caption, parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  jobLog.info({ storyId: item.id, kind: media.kind }, "no file_id — uploading to log channel");
+  const filename = media.filename ?? `story_${Date.now()}`;
+  const inputFile = new InputFile(media.buffer, filename);
+  const logChannelId = pickLogChannel();
+
+  if (media.kind === "video") {
+    const sent = await api.sendVideo(logChannelId, inputFile, { caption, parse_mode: "HTML" });
+    const fileId = sent.video?.file_id;
+    if (fileId) {
+      await setFileId(item.id, fileId, "video");
+      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
+      await api.sendVideo(chatId, fileId, { caption, parse_mode: "HTML" });
+    }
+  } else {
+    const sent = await api.sendPhoto(logChannelId, inputFile, { caption, parse_mode: "HTML" });
+    const fileId = sent.photo?.[sent.photo.length - 1]?.file_id;
+    if (fileId) {
+      await setFileId(item.id, fileId, "photo");
+      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
+      await api.sendPhoto(chatId, fileId, { caption, parse_mode: "HTML" });
+    }
+  }
 }
 
 // Three-tier resolution for a single story item:
@@ -83,14 +132,20 @@ async function fetchMediaItem(
   if (!downloaded) return null;
   await setCachedStory(item.id, downloaded, item.kind);
   jobLog.info({ storyId: item.id }, "downloaded from Telegram");
+
+  // Jitter delay after each MTProto download to reduce per-session request rate.
+  const jitter = REQUEST_JITTER_MS_MIN + Math.random() * (REQUEST_JITTER_MS_MAX - REQUEST_JITTER_MS_MIN);
+  await new Promise<void>((resolve) => setTimeout(resolve, jitter));
+
   return { buffer: downloaded, kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
 }
 
 // Fetches and sends a single story item immediately when ready.
-// index is the item's 0-based position in pageRawItems; total is pageRawItems.length.
+// counter.value is incremented right before the send so numbering reflects
+// delivery order — the first item to finish gets 1/total, second gets 2/total, etc.
 async function fetchAndSend(
   item: RawStoryItem,
-  index: number,
+  counter: { value: number },
   total: number,
   chatId: number,
   client: Parameters<typeof downloadRawItem>[0],
@@ -102,41 +157,11 @@ async function fetchAndSend(
     return;
   }
 
+  // Increment atomically before sending — JS single-threaded event loop guarantees
+  // no two concurrent fetchAndSend calls can both read and increment simultaneously.
+  const index = ++counter.value;
   const caption = buildCaption(index, total, item.date, media.caption);
-
-  if (media.fileId) {
-    jobLog.info({ storyId: item.id, kind: media.kind }, "sending via cached file_id");
-    if (media.kind === "video") {
-      await api.sendVideo(chatId, media.fileId, { caption, parse_mode: "HTML" });
-    } else {
-      await api.sendPhoto(chatId, media.fileId, { caption, parse_mode: "HTML" });
-    }
-    return;
-  }
-
-  // No cached file_id — upload buffer to log channel to obtain a stable file_id.
-  jobLog.info({ storyId: item.id, kind: media.kind }, "no file_id — uploading to log channel");
-  const filename = media.filename ?? `story_${Date.now()}`;
-  const inputFile = new InputFile(media.buffer, filename);
-  const logChannelId = pickLogChannel();
-
-  if (media.kind === "video") {
-    const sent = await api.sendVideo(logChannelId, inputFile, { caption, parse_mode: "HTML" });
-    const fileId = sent.video?.file_id;
-    if (fileId) {
-      await setFileId(item.id, fileId, "video");
-      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
-      await api.sendVideo(chatId, fileId, { caption, parse_mode: "HTML" });
-    }
-  } else {
-    const sent = await api.sendPhoto(logChannelId, inputFile, { caption, parse_mode: "HTML" });
-    const fileId = sent.photo?.[sent.photo.length - 1]?.file_id;
-    if (fileId) {
-      await setFileId(item.id, fileId, "photo");
-      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
-      await api.sendPhoto(chatId, fileId, { caption, parse_mode: "HTML" });
-    }
-  }
+  await sendMedia(media, item, caption, chatId, jobLog);
 }
 
 async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
@@ -163,6 +188,46 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
   const jobLog = log.child({ phone });
 
   try {
+    // --- Single story by ID (from a t.me/{username}/s/{id} link) ---
+    if (type === "single") {
+      const storyId = job.data.storyId;
+      if (!storyId) {
+        await api.editMessageText(chatId, queuedMessageId, "❌ Story not found or has expired.");
+        return;
+      }
+
+      const item = await fetchSingleStory(client, targetUsername, storyId);
+      if (!item) {
+        jobLog.info({ storyId }, "single story not found");
+        await api.editMessageText(chatId, queuedMessageId, "❌ Story not found or has expired.");
+        return;
+      }
+
+      const media = await fetchMediaItem(item, client, jobLog);
+      if (!media) {
+        await api.editMessageText(chatId, queuedMessageId, "❌ Story not found or has expired.");
+        return;
+      }
+
+      const caption = buildSingleCaption(item.date, media.caption);
+      await sendMedia(media, item, caption, chatId, jobLog);
+      await api.editMessageText(chatId, queuedMessageId, "✅ Done.");
+
+      const user = await UserModel.findOne({ telegramId: Number(userId) }).select("_id");
+      if (user) {
+        await DownloadModel.create({
+          userId: user._id,
+          targetUsername,
+          type,
+          sessionPhone: phone,
+          mediaCount: 1,
+          status: "success",
+          downloadedAt: new Date(),
+        });
+      }
+      return;
+    }
+
     // --- Determine which raw items to process for this job ---
     let pageRawItems: RawStoryItem[];
     let totalStoryCount = 0;
@@ -219,14 +284,17 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
         );
 
         // Fetch from Telegram only when at least one item is not yet cached.
-        // If all items are cached this entire block is skipped — zero Telegram calls.
+        // Use targeted GetStoriesByID calls (one per missing ID) rather than
+        // re-fetching the full story list — far fewer MTProto calls.
         const freshItemMap = new Map<number, RawStoryItem>();
         if (uncachedIds.size > 0) {
-          jobLog.info({ uncachedCount: uncachedIds.size }, "cache misses in page — fetching from Telegram");
-          const freshItems = await fetchRawItems(client, targetUsername, "all");
-          for (const item of freshItems) {
-            if (uncachedIds.has(item.id)) freshItemMap.set(item.id, item);
-          }
+          jobLog.info({ uncachedCount: uncachedIds.size }, "cache misses in page — fetching individually");
+          await Promise.all(
+            [...uncachedIds].map(async (id) => {
+              const item = await fetchSingleStory(client, targetUsername, id);
+              if (item) freshItemMap.set(id, item);
+            })
+          );
         }
 
         // Build pageRawItems from cached metadata. For items that are already in
@@ -258,12 +326,14 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
     }
 
     // --- Fetch and send each item concurrently, out of order ---
-    // Each item is sent immediately when ready. One failure doesn't block others.
-    // index is the item's stable position in pageRawItems, used for the caption header.
+    // counter.value is shared across all concurrent fetchAndSend calls.
+    // Each item increments it right before sending, so numbering reflects
+    // actual delivery order rather than story list position.
     const total = pageRawItems.length;
+    const counter = { value: 0 };
     const settlements = await Promise.allSettled(
-      pageRawItems.map((item, index) =>
-        fetchAndSend(item, index, total, chatId, client, jobLog)
+      pageRawItems.map((item) =>
+        fetchAndSend(item, counter, total, chatId, client, jobLog)
       )
     );
 
@@ -315,15 +385,21 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
 
     if (message.includes("AUTH_KEY_UNREGISTERED")) {
       await gramJsPool.evictSession(phone);
-      await api
-        .sendMessage(
-          SUPER_ADMIN_ID,
-          `⚠️ Session ${phone} was revoked by Telegram and has been removed from the pool.`
-        )
-        .catch(() => {});
+      // Phone number is already in the structured log above — suppress it from
+      // the Telegram notification to avoid leaking session details.
+      logger.warn({ phone }, "session revoked and evicted from pool");
     }
 
-    await api.editMessageText(chatId, queuedMessageId, `❌ Failed: ${message}`).catch(() => {});
+    // On FLOOD_WAIT, mark the session in Redis so pickClient skips it for the
+    // duration Telegram demands. The TTL includes a 5-second buffer.
+    const floodMatch = message.match(/FLOOD_WAIT_(\d+)/);
+    if (floodMatch) {
+      const waitSeconds = parseInt(floodMatch[1], 10);
+      await redis.set(`session:floodwait:${phone}`, "1", "EX", waitSeconds + 5);
+      logger.warn({ phone, waitSeconds }, "session flood-waited, marked in Redis");
+    }
+
+    await api.editMessageText(chatId, queuedMessageId, toUserMessage(error)).catch(() => {});
 
     // Only write a failed download record on the final attempt to avoid
     // polluting the DB with entries for transient failures that later succeed.
@@ -346,6 +422,9 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
     throw error;
   } finally {
     gramJsPool.decrementSessionLoad(phone);
+    // Stamp lastUsed at job completion so SESSION_COOLDOWN_MS measures idle time
+    // since the last job finished, not since it was picked.
+    gramJsPool.touchLastUsed(phone);
   }
 }
 
@@ -372,8 +451,7 @@ export function startWorker(): Worker<DownloadJobPayload> {
     const isPermanentFailure = job.attemptsMade >= (job.opts.attempts ?? 1);
     if (isPermanentFailure) {
       const { chatId, queuedMessageId } = job.data;
-      const message = error instanceof Error ? error.message : String(error);
-      api.editMessageText(chatId, queuedMessageId, `❌ Failed: ${message}`).catch(() => {});
+      api.editMessageText(chatId, queuedMessageId, toUserMessage(error)).catch(() => {});
     }
   });
 

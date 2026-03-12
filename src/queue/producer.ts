@@ -5,9 +5,10 @@ export type DownloadJobPayload = {
   userId: string;
   chatId: number;
   targetUsername: string;
-  type: "current" | "last" | "all";
+  type: "current" | "last" | "all" | "single";
   queuedMessageId: number;
   offset?: number;
+  storyId?: number;
 };
 
 const MAX_QUEUE_SIZE = 5000;

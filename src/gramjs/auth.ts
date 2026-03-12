@@ -4,8 +4,10 @@ import { Api } from "telegram";
 import { computeCheck } from "telegram/Password";
 import { randomUUID } from "node:crypto";
 import { TELEGRAM_API_HASH, TELEGRAM_API_ID } from "../config";
+import { getDeviceProfile } from "../utils/deviceFingerprint";
 
-export async function createAuthClient(): Promise<TelegramClient> {
+export async function createAuthClient(phone: string): Promise<TelegramClient> {
+  const profile = getDeviceProfile(phone);
   const client = new TelegramClient(new StringSession(""), TELEGRAM_API_ID, TELEGRAM_API_HASH, {
     autoReconnect: true,
     connectionRetries: 10,
@@ -13,6 +15,11 @@ export async function createAuthClient(): Promise<TelegramClient> {
     timeout: 30,
     useWSS: false,
     downloadRetries: 5,
+    deviceModel: profile.deviceModel,
+    systemVersion: profile.systemVersion,
+    appVersion: profile.appVersion,
+    langCode: profile.langCode,
+    systemLangCode: profile.systemLangCode,
   });
   await client.connect();
   return client;

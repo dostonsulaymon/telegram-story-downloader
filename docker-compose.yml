@@ -1,0 +1,42 @@
+services:
+  bot:
+    build: .
+    command: npm run bot
+    env_file: .env
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - app
+
+  worker:
+    build: .
+    command: npm run worker
+    env_file: .env
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - app
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - app
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - app
+
+volumes:
+  mongo_data:
+  redis_data:
+
+networks:
+  app:

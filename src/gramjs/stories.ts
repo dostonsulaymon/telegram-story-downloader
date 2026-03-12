@@ -2,7 +2,7 @@ import { TelegramClient, Api } from "telegram";
 import { readFile } from "node:fs/promises";
 import { logger } from "../logger";
 
-export type DownloadType = "current" | "last" | "all";
+export type DownloadType = "current" | "last" | "all" | "single";
 
 export type StoryMedia = {
   buffer: Buffer;
@@ -158,6 +158,26 @@ export async function downloadRawItem(
   const downloaded = await client.downloadMedia(item.media);
   if (!downloaded) return null;
   return bufferFromDownload(downloaded);
+}
+
+// Fetches a single story by ID using GetStoriesByID — avoids fetching the full
+// story list. Returns null if the story is not found or has expired.
+export async function fetchSingleStory(
+  client: TelegramClient,
+  username: string,
+  storyId: number
+): Promise<RawStoryItem | null> {
+  logger.info({ username, storyId }, "resolving entity for single story fetch");
+  const entity = await client.getEntity(username);
+  const peer = entity as unknown as Api.TypeInputPeer;
+
+  const result = await client.invoke(
+    new Api.stories.GetStoriesByID({ peer, id: [storyId] })
+  );
+
+  const items = extractItems(result);
+  if (items.length === 0) return null;
+  return toRawItem(items[0]);
 }
 
 // Re-fetches the full story list to get a fresh fileReference for a specific story.

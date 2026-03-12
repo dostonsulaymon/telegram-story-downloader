@@ -4,7 +4,7 @@ const downloadSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     targetUsername: { type: String, required: true },
-    type: { type: String, required: true, enum: ["current", "last", "all"] },
+    type: { type: String, required: true, enum: ["current", "last", "all", "single"] },
     sessionPhone: { type: String, required: true },
     mediaCount: { type: Number, required: true },
     status: { type: String, required: true, enum: ["success", "failed"], default: "success" },

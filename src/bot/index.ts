@@ -112,6 +112,41 @@ export function createBot(): Bot<BotContext> {
   registerAdminsCommand(adminRouter);
   registerStatsCommand(adminRouter);
 
+  // Handles direct story links: https://t.me/{username}/s/{storyId}
+  // Must be registered before the general text handler so story links are
+  // not passed to normalizeUsername (which would fail to parse them).
+  const STORY_LINK_RE = /^(?:https?:\/\/)?t\.me\/([A-Za-z0-9_]{5,32})\/s\/(\d+)\/?$/i;
+
+  bot.on("message:text", async (ctx, next) => {
+    const match = ctx.message.text.match(STORY_LINK_RE);
+    if (!match) return next();
+
+    const username = match[1];
+    const storyId = Number(match[2]);
+    const userId = String(ctx.from!.id);
+
+    const rateCheck = await checkRateLimit(userId);
+    if (!rateCheck.allowed) {
+      await ctx.reply(`⚠️ Too many requests, try again in ${rateCheck.retryAfter} seconds.`);
+      return;
+    }
+
+    const statusMsg = await ctx.reply(`⏳ Fetching story #${storyId} from @${username}...`);
+
+    try {
+      await addDownloadJob({
+        userId,
+        chatId: ctx.chat.id,
+        targetUsername: username,
+        type: "single",
+        queuedMessageId: statusMsg.message_id,
+        storyId,
+      });
+    } catch {
+      await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, "⚠️ Service is overloaded, try again later.");
+    }
+  });
+
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     if (text.startsWith("/")) {
