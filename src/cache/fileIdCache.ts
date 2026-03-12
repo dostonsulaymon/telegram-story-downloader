@@ -1,23 +1,26 @@
-import { redis } from "../redis";
+import { FileIdCacheModel } from "../models/fileid.model";
 import { logger } from "../logger";
 
-function fileIdKey(storyId: number): string {
-  return `fileid:${storyId}`;
-}
+type FileIdEntry = { fileId: string; kind: "photo" | "video" };
 
-// Permanent file_id cache — no TTL. Telegram file_ids obtained via the Bot API
-// are stable for the lifetime of the file and can be reused indefinitely.
-export async function getFileId(storyId: number): Promise<string | null> {
-  const value = await redis.get(fileIdKey(storyId));
-  if (value) {
-    logger.debug({ storyId, fileId: value }, "file_id cache hit");
-  } else {
+// Permanent file_id store backed by MongoDB — survives Redis restarts.
+// Stores both the file_id and media kind so the send path knows which
+// Bot API method to call without a separate lookup.
+export async function getFileId(storyId: number): Promise<FileIdEntry | null> {
+  const doc = await FileIdCacheModel.findOne({ storyId }).lean();
+  if (!doc) {
     logger.debug({ storyId }, "file_id cache miss");
+    return null;
   }
-  return value;
+  logger.debug({ storyId, fileId: doc.fileId, kind: doc.kind }, "file_id cache hit");
+  return { fileId: doc.fileId, kind: doc.kind };
 }
 
-export async function setFileId(storyId: number, fileId: string): Promise<void> {
-  await redis.set(fileIdKey(storyId), fileId);
-  logger.debug({ storyId, fileId }, "file_id cached");
+export async function setFileId(storyId: number, fileId: string, kind: "photo" | "video"): Promise<void> {
+  await FileIdCacheModel.findOneAndUpdate(
+    { storyId },
+    { fileId, kind, cachedAt: new Date() },
+    { upsert: true }
+  );
+  logger.debug({ storyId, fileId, kind }, "file_id cached");
 }

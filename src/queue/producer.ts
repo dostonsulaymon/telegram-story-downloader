@@ -17,6 +17,7 @@ const JOB_OPTIONS = {
   backoff: { type: "exponential", delay: 5000 },
   removeOnComplete: { count: 1000 },
   removeOnFail: { count: 500 },
+  lockDuration: 300000,
 } as const;
 
 // BullMQ requires a dedicated connection — duplicate() clones the shared

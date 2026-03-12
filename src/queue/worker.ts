@@ -36,6 +36,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   ]);
 }
 
+function formatStoryDate(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function buildCaption(index: number, total: number, date: number, originalCaption?: string): string {
+  const header = `${index + 1}/${total} · ${formatStoryDate(date)}`;
+  return originalCaption ? `${header}\n${originalCaption}` : header;
+}
+
 // Three-tier resolution for a single story item:
 //   1. Permanent file_id cache  — instant, no download, no upload
 //   2. Buffer cache (photos)    — no Telegram download, but still needs log channel upload
@@ -48,10 +58,10 @@ async function fetchMediaItem(
   jobLog: pino.Logger<never>
 ): Promise<StoryMedia | null> {
   // Tier 1: permanent file_id cache — no buffer needed at all.
-  const cachedFileId = await getFileId(item.id);
-  if (cachedFileId) {
+  const fileIdEntry = await getFileId(item.id);
+  if (fileIdEntry) {
     jobLog.info({ storyId: item.id }, "file_id cache hit");
-    return { fileId: cachedFileId, buffer: Buffer.alloc(0), kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
+    return { fileId: fileIdEntry.fileId, buffer: Buffer.alloc(0), kind: fileIdEntry.kind, filename: item.filename, date: item.date, caption: item.caption };
   }
 
   // Tier 2: Redis buffer cache (photos only — videos are skipped by setCachedStory).
@@ -74,6 +84,59 @@ async function fetchMediaItem(
   await setCachedStory(item.id, downloaded, item.kind);
   jobLog.info({ storyId: item.id }, "downloaded from Telegram");
   return { buffer: downloaded, kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
+}
+
+// Fetches and sends a single story item immediately when ready.
+// index is the item's 0-based position in pageRawItems; total is pageRawItems.length.
+async function fetchAndSend(
+  item: RawStoryItem,
+  index: number,
+  total: number,
+  chatId: number,
+  client: Parameters<typeof downloadRawItem>[0],
+  jobLog: pino.Logger<never>
+): Promise<void> {
+  const media = await fetchMediaItem(item, client, jobLog);
+  if (!media) {
+    jobLog.warn({ storyId: item.id }, "all resolution tiers failed, skipping item");
+    return;
+  }
+
+  const caption = buildCaption(index, total, item.date, media.caption);
+
+  if (media.fileId) {
+    jobLog.info({ storyId: item.id, kind: media.kind }, "sending via cached file_id");
+    if (media.kind === "video") {
+      await api.sendVideo(chatId, media.fileId, { caption, parse_mode: "HTML" });
+    } else {
+      await api.sendPhoto(chatId, media.fileId, { caption, parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // No cached file_id — upload buffer to log channel to obtain a stable file_id.
+  jobLog.info({ storyId: item.id, kind: media.kind }, "no file_id — uploading to log channel");
+  const filename = media.filename ?? `story_${Date.now()}`;
+  const inputFile = new InputFile(media.buffer, filename);
+  const logChannelId = pickLogChannel();
+
+  if (media.kind === "video") {
+    const sent = await api.sendVideo(logChannelId, inputFile, { caption, parse_mode: "HTML" });
+    const fileId = sent.video?.file_id;
+    if (fileId) {
+      await setFileId(item.id, fileId, "video");
+      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
+      await api.sendVideo(chatId, fileId, { caption, parse_mode: "HTML" });
+    }
+  } else {
+    const sent = await api.sendPhoto(logChannelId, inputFile, { caption, parse_mode: "HTML" });
+    const fileId = sent.photo?.[sent.photo.length - 1]?.file_id;
+    if (fileId) {
+      await setFileId(item.id, fileId, "photo");
+      jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
+      await api.sendPhoto(chatId, fileId, { caption, parse_mode: "HTML" });
+    }
+  }
 }
 
 async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
@@ -194,61 +257,22 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
       return;
     }
 
-    // --- Resolve all items concurrently (file_id cache → buffer cache → download) ---
-    const results = await Promise.all(
-      pageRawItems.map((item) => fetchMediaItem(item, client, jobLog))
+    // --- Fetch and send each item concurrently, out of order ---
+    // Each item is sent immediately when ready. One failure doesn't block others.
+    // index is the item's stable position in pageRawItems, used for the caption header.
+    const total = pageRawItems.length;
+    const settlements = await Promise.allSettled(
+      pageRawItems.map((item, index) =>
+        fetchAndSend(item, index, total, chatId, client, jobLog)
+      )
     );
 
-    // Pair each result with its source RawStoryItem to retain the story ID.
-    // Filter out items where all resolution tiers failed.
-    const sendQueue = pageRawItems
-      .map((item, i) => ({ item, media: results[i] }))
-      .filter((p): p is { item: RawStoryItem; media: StoryMedia } => p.media !== null);
+    const successCount = settlements.filter((s) => s.status === "fulfilled").length;
 
-    if (sendQueue.length === 0) {
+    if (successCount === 0) {
       await api.editMessageText(chatId, queuedMessageId, "✅ Done — no stories found.");
       if (type === "all") await clearPaginationState(userId, targetUsername);
       return;
-    }
-
-    // --- Send media ---
-    // If media.fileId is set (tier 1 hit), send directly — no upload needed.
-    // Otherwise upload buffer to a log channel to get a stable file_id, cache it,
-    // then forward to the user via file_id.
-    for (const { item, media } of sendQueue) {
-      if (media.fileId) {
-        jobLog.info({ storyId: item.id, kind: media.kind }, "sending via cached file_id");
-        if (media.kind === "video") {
-          await api.sendVideo(chatId, media.fileId, { caption: media.caption, parse_mode: "HTML" });
-        } else {
-          await api.sendPhoto(chatId, media.fileId, { caption: media.caption, parse_mode: "HTML" });
-        }
-        continue;
-      }
-
-      // No cached file_id — upload buffer to log channel to obtain a stable file_id.
-      jobLog.info({ storyId: item.id, kind: media.kind }, "no file_id — uploading to log channel");
-      const filename = media.filename ?? `story_${Date.now()}`;
-      const inputFile = new InputFile(media.buffer, filename);
-      const logChannelId = pickLogChannel();
-
-      if (media.kind === "video") {
-        const sent = await api.sendVideo(logChannelId, inputFile, { caption: media.caption, parse_mode: "HTML" });
-        const fileId = sent.video?.file_id;
-        if (fileId) {
-          await setFileId(item.id, fileId);
-          jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
-          await api.sendVideo(chatId, fileId, { caption: media.caption, parse_mode: "HTML" });
-        }
-      } else {
-        const sent = await api.sendPhoto(logChannelId, inputFile, { caption: media.caption, parse_mode: "HTML" });
-        const fileId = sent.photo?.[sent.photo.length - 1]?.file_id;
-        if (fileId) {
-          await setFileId(item.id, fileId);
-          jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
-          await api.sendPhoto(chatId, fileId, { caption: media.caption, parse_mode: "HTML" });
-        }
-      }
     }
 
     // --- Status message + pagination follow-up for "all" ---
@@ -257,7 +281,7 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
       const remaining = totalStoryCount - nextOffset;
 
       if (remaining > 0) {
-        await api.editMessageText(chatId, queuedMessageId, `✅ ${sendQueue.length} file(s) sent.`);
+        await api.editMessageText(chatId, queuedMessageId, `✅ ${successCount} file(s) sent.`);
         await api.sendMessage(chatId, `📄 ${remaining} more stor${remaining === 1 ? "y" : "ies"} available.`, {
           reply_markup: new InlineKeyboard().text(
             `Load more (${remaining} remaining)`,
@@ -266,10 +290,10 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
         });
       } else {
         await clearPaginationState(userId, targetUsername);
-        await api.editMessageText(chatId, queuedMessageId, `✅ Done — ${sendQueue.length} file(s) sent.`);
+        await api.editMessageText(chatId, queuedMessageId, `✅ Done — ${successCount} file(s) sent.`);
       }
     } else {
-      await api.editMessageText(chatId, queuedMessageId, `✅ Done — ${sendQueue.length} file(s) sent.`);
+      await api.editMessageText(chatId, queuedMessageId, `✅ Done — ${successCount} file(s) sent.`);
     }
 
     // --- Record successful download ---
@@ -280,7 +304,7 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
         targetUsername,
         type,
         sessionPhone: phone,
-        mediaCount: sendQueue.length,
+        mediaCount: successCount,
         status: "success",
         downloadedAt: new Date(),
       });
@@ -333,6 +357,8 @@ export function startWorker(): Worker<DownloadJobPayload> {
   _worker = new Worker<DownloadJobPayload>("download", processJob, {
     connection: redis.duplicate(),
     concurrency: WORKER_CONCURRENCY,
+    stalledInterval: 30000,
+    maxStalledCount: 2,
   });
 
   _worker.on("completed", (job) => {
@@ -341,6 +367,14 @@ export function startWorker(): Worker<DownloadJobPayload> {
 
   _worker.on("failed", (job, error) => {
     logger.error({ jobId: job?.id, err: error }, "job failed permanently");
+
+    if (!job) return;
+    const isPermanentFailure = job.attemptsMade >= (job.opts.attempts ?? 1);
+    if (isPermanentFailure) {
+      const { chatId, queuedMessageId } = job.data;
+      const message = error instanceof Error ? error.message : String(error);
+      api.editMessageText(chatId, queuedMessageId, `❌ Failed: ${message}`).catch(() => {});
+    }
   });
 
   return _worker;

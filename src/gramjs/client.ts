@@ -33,21 +33,23 @@ export class GramJsPool {
   async loadActiveSessions(): Promise<void> {
     const sessions = await SessionModel.find({ status: "active" }).lean();
 
-    for (const session of sessions) {
-      try {
-        const client = buildClient(session.sessionString);
-        await client.connect();
+    await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const client = buildClient(session.sessionString);
+          await client.connect();
 
-        this.clients.set(session.phone, {
-          client,
-          lastUsed: session.lastUsed ?? null,
-        });
-        this.activeJobs.set(session.phone, 0);
-      } catch (error) {
-        logger.error({ phone: session.phone, err: error }, "failed to load session");
-        await SessionModel.updateOne({ phone: session.phone }, { $set: { status: "banned" } });
-      }
-    }
+          this.clients.set(session.phone, {
+            client,
+            lastUsed: session.lastUsed ?? null,
+          });
+          this.activeJobs.set(session.phone, 0);
+        } catch (error) {
+          logger.error({ phone: session.phone, err: error }, "failed to load session");
+          await SessionModel.updateOne({ phone: session.phone }, { $set: { status: "banned" } });
+        }
+      })
+    );
 
     // Subscribe to cross-process pool events. When another process adds or
     // removes a session (e.g. bot adds via /addsession, worker receives the
