@@ -329,8 +329,9 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
     // counter.value is shared across all concurrent fetchAndSend calls.
     // Each item increments it right before sending, so numbering reflects
     // actual delivery order rather than story list position.
-    const total = pageRawItems.length;
-    const counter = { value: 0 };
+    const allIds = await getPaginationState(userId, targetUsername);
+    const total = allIds?.length ?? pageRawItems.length;
+    const counter = { value: offset };
     const settlements = await Promise.allSettled(
       pageRawItems.map((item) =>
         fetchAndSend(item, counter, total, chatId, client, jobLog)
