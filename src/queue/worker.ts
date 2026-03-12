@@ -36,9 +36,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   ]);
 }
 
-// Download (or serve from cache) a single story item using the job's session.
-// Using the same session that fetched the story metadata guarantees the
-// fileReference is valid — fileReferences are tied to the session that obtained them.
+// Three-tier resolution for a single story item:
+//   1. Permanent file_id cache  — instant, no download, no upload
+//   2. Buffer cache (photos)    — no Telegram download, but still needs log channel upload
+//   3. Fresh download            — full MTProto download + log channel upload
 // Returns null if the item could not be retrieved so the caller can skip it
 // without failing the batch.
 async function fetchMediaItem(
@@ -46,13 +47,23 @@ async function fetchMediaItem(
   client: Parameters<typeof downloadRawItem>[0],
   jobLog: pino.Logger<never>
 ): Promise<StoryMedia | null> {
-  const buffer = await getCachedStory(item.id);
+  // Tier 1: permanent file_id cache — no buffer needed at all.
+  const cachedFileId = await getFileId(item.id);
+  if (cachedFileId) {
+    jobLog.info({ storyId: item.id }, "file_id cache hit");
+    return { fileId: cachedFileId, buffer: Buffer.alloc(0), kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
+  }
 
+  // Tier 2: Redis buffer cache (photos only — videos are skipped by setCachedStory).
+  const buffer = await getCachedStory(item.id);
   if (buffer) {
-    jobLog.info({ storyId: item.id }, "cache hit");
+    jobLog.info({ storyId: item.id }, "buffer cache hit");
     return { buffer, kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
   }
 
+  // Tier 3: download from Telegram via the job's MTProto session.
+  // Using the same session that fetched story metadata guarantees the
+  // fileReference is valid — fileReferences are tied to the session that obtained them.
   const timeoutMs = item.kind === "video" ? VIDEO_DOWNLOAD_TIMEOUT_MS : PHOTO_DOWNLOAD_TIMEOUT_MS;
   const downloaded = await withTimeout(
     downloadRawItem(client, item),
@@ -61,7 +72,7 @@ async function fetchMediaItem(
   );
   if (!downloaded) return null;
   await setCachedStory(item.id, downloaded, item.kind);
-  jobLog.info({ storyId: item.id }, "cache miss — downloaded and cached");
+  jobLog.info({ storyId: item.id }, "downloaded from Telegram");
   return { buffer: downloaded, kind: item.kind, filename: item.filename, date: item.date, caption: item.caption };
 }
 
@@ -183,17 +194,13 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
       return;
     }
 
-    // --- Download / cache all items in the page concurrently ---
-    // All items use the same session so fileReferences remain valid.
-    // GramJS handles concurrent downloads via separate DC connections for file
-    // transfers — photos (2 min timeout) and videos (5 min timeout) run in parallel.
-    // Items that return null (failed or empty) are filtered out.
+    // --- Resolve all items concurrently (file_id cache → buffer cache → download) ---
     const results = await Promise.all(
       pageRawItems.map((item) => fetchMediaItem(item, client, jobLog))
     );
 
-    // Pair each result with its source RawStoryItem to retain the story ID for
-    // file_id cache lookups. Filter out items where download failed.
+    // Pair each result with its source RawStoryItem to retain the story ID.
+    // Filter out items where all resolution tiers failed.
     const sendQueue = pageRawItems
       .map((item, i) => ({ item, media: results[i] }))
       .filter((p): p is { item: RawStoryItem; media: StoryMedia } => p.media !== null);
@@ -204,24 +211,23 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
       return;
     }
 
-    // --- Send media via file_id (permanent cache) ---
-    // On first delivery: upload buffer to a log channel to obtain a permanent file_id,
-    // store it, then forward to the user via file_id. On subsequent deliveries: use
-    // cached file_id directly — no buffer download needed.
+    // --- Send media ---
+    // If media.fileId is set (tier 1 hit), send directly — no upload needed.
+    // Otherwise upload buffer to a log channel to get a stable file_id, cache it,
+    // then forward to the user via file_id.
     for (const { item, media } of sendQueue) {
-      const cachedFileId = await getFileId(item.id);
-
-      if (cachedFileId) {
-        jobLog.info({ storyId: item.id }, "file_id cache hit — sending directly");
+      if (media.fileId) {
+        jobLog.info({ storyId: item.id, kind: media.kind }, "sending via cached file_id");
         if (media.kind === "video") {
-          await api.sendVideo(chatId, cachedFileId, { caption: media.caption, parse_mode: "HTML" });
+          await api.sendVideo(chatId, media.fileId, { caption: media.caption, parse_mode: "HTML" });
         } else {
-          await api.sendPhoto(chatId, cachedFileId, { caption: media.caption, parse_mode: "HTML" });
+          await api.sendPhoto(chatId, media.fileId, { caption: media.caption, parse_mode: "HTML" });
         }
         continue;
       }
 
-      // No cached file_id — upload to log channel first to get a stable file_id.
+      // No cached file_id — upload buffer to log channel to obtain a stable file_id.
+      jobLog.info({ storyId: item.id, kind: media.kind }, "no file_id — uploading to log channel");
       const filename = media.filename ?? `story_${Date.now()}`;
       const inputFile = new InputFile(media.buffer, filename);
       const logChannelId = pickLogChannel();
@@ -231,7 +237,7 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
         const fileId = sent.video?.file_id;
         if (fileId) {
           await setFileId(item.id, fileId);
-          jobLog.info({ storyId: item.id, logChannelId }, "file_id cached from log channel upload");
+          jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
           await api.sendVideo(chatId, fileId, { caption: media.caption, parse_mode: "HTML" });
         }
       } else {
@@ -239,7 +245,7 @@ async function processJob(job: Job<DownloadJobPayload>): Promise<void> {
         const fileId = sent.photo?.[sent.photo.length - 1]?.file_id;
         if (fileId) {
           await setFileId(item.id, fileId);
-          jobLog.info({ storyId: item.id, logChannelId }, "file_id cached from log channel upload");
+          jobLog.info({ storyId: item.id, logChannelId }, "uploaded to log channel, sending to user via file_id");
           await api.sendPhoto(chatId, fileId, { caption: media.caption, parse_mode: "HTML" });
         }
       }

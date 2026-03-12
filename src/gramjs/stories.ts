@@ -10,6 +10,7 @@ export type StoryMedia = {
   filename?: string;
   date: number;
   caption?: string;
+  fileId?: string;
 };
 
 // Story item metadata without the downloaded buffer — used by the worker to
