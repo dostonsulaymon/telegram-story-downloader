@@ -3,7 +3,7 @@ import { addDownloadJob, getQueueStats } from "../src/queue/producer";
 import { MONGO_URI } from "../src/config";
 
 const CONCURRENT_USERS = 50;
-const TARGET_USERNAME = "REDACTED_USERNAME";
+const TARGET_USERNAME = process.env.LOADTEST_TARGET_USERNAME ?? "durov";
 const BASE_USER_ID = 1_000_000;
 const BASE_CHAT_ID = 1_000_000;
 const POLL_INTERVAL_MS = 5_000;

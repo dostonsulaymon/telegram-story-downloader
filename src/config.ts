@@ -33,7 +33,7 @@ export const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS ?? "3600
 export const LOG_LEVEL = process.env.LOG_LEVEL ?? "info";
 export const LOG_CHANNEL_IDS: number[] = process.env.LOG_CHANNEL_IDS
   ? (JSON.parse(process.env.LOG_CHANNEL_IDS) as number[])
-  : [CHANNEL_ID_REDACTED, CHANNEL_ID_REDACTED, CHANNEL_ID_REDACTED, CHANNEL_ID_REDACTED];
+  : [];
 
 // "dev" restricts the session pool to DEV_SESSION_PHONE only.
 // "prod" uses all active sessions with normal selection logic.
